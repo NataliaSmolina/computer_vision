@@ -1,0 +1,9 @@
+{
+  "model": "CompVis/ldm-super-resolution-4x-openimages",
+  "size": 256,
+  "steps": 12,
+  "seed": 42,
+  "degradation": "realesrgan_like",
+  "lr_sha256": "ac736d2ab4dcce19eaebd63cd36d9286ef29f5a4685a3df962511d852441cd86",
+  "source_sha256": "5e2f94380d685956cdb070449f2d39152bb90aee7d62c04efe006c4b3730b2bf"
+}
