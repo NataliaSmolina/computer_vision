@@ -33,13 +33,21 @@ def parse_args(argv=None):
     parser.add_argument("--no-install", action="store_true", help="Use current Python environment")
     parser.add_argument("--images", type=int, default=3, help="Number of DIV2K validation examples")
     parser.add_argument("--size", type=int, default=256, help="HR crop size, divisible by 128")
-    parser.add_argument("--steps", type=int, default=12, help="DDIM denoising steps")
+    parser.add_argument("--steps", type=int, default=25, help="DDIM denoising steps")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "mps", "cuda", "cpu"), default="auto")
     parser.add_argument("--out", type=Path, default=PROJECT_DIR)
     parser.add_argument("--hr-dir", type=Path, help="Optional already-downloaded DIV2K HR PNG directory")
     parser.add_argument("--unknown-dir", type=Path, help="Optional DIV2K unknown-X4 PNG directory")
     parser.add_argument("--skip-metrics", action="store_true", help="Skip pretrained LPIPS and CLIP-IQA")
+    parser.add_argument("--step-plots", action="store_true",
+                        help="Optional diagnostic: save estimated CLEAN image at selected DDIM steps")
+    parser.add_argument("--no-step-plots", action="store_true",
+                        help="Legacy option: disable optional step diagnostics (already off by default)")
+    parser.add_argument("--step-plots-all-images", action="store_true",
+                        help="Save DDIM intermediate-step visualization for every image, not just the first")
+    parser.add_argument("--plots-only", action="store_true",
+                        help="Build ALL_MASKS comparisons from saved results without running diffusion or metrics")
     parser.add_argument("--degradations", nargs="+", choices=DEGRADATIONS, default=list(DEGRADATIONS))
     args = parser.parse_args(argv)
     if not (1 <= args.images <= 100):
@@ -53,7 +61,7 @@ def parse_args(argv=None):
 
 def bootstrap(args):
     """Install everything once into an isolated environment; no global pip edits."""
-    if args.self_test or args.no_install or os.environ.get("SR_INPAINTING_IN_VENV") == "1":
+    if args.self_test or args.no_install or args.plots_only or os.environ.get("SR_INPAINTING_IN_VENV") == "1":
         return
     if not (sys.version_info >= (3, 10) and sys.version_info < (3, 14)):
         raise RuntimeError("Use Python 3.10-3.13 (preferably Python 3.11/3.12) for PyTorch on macOS.")
@@ -334,7 +342,7 @@ def seed_noise(shape, seed, device):
     return torch.randn(shape, generator=generator, device="cpu", dtype=torch.float32).to(device)
 
 
-def denoise_with_mask(pipe, lowres, source, mask, steps, seed, device, trace=None):
+def denoise_with_mask(pipe, lowres, source, mask, steps, seed, device, trace=None, step_images=None, capture_steps=None):
     """Modified version of the upstream LDMSuperResolutionPipeline sampling.
 
     Input condition: genuine LR pixels, normalized to [-1, 1].
@@ -344,6 +352,9 @@ def denoise_with_mask(pipe, lowres, source, mask, steps, seed, device, trace=Non
     For each DDIM transition, anchor unmasked latent to the forward-noised
     VQ-encoding of the *bicubic-upscaled INPUT* (NEVER HR ground truth).
     Final RGB pixel composition guarantees exact preservation outside ROI.
+    Optional step_images records the DDIM prediction of the CLEAN image at each
+    selected step. Decoding a still-noisy latent directly is invalid as a preview.
+    The binary mask itself remains constant; only the estimated image changes.
     """
     if lowres.shape[0] * 4 != source.shape[0] or lowres.shape[1] * 4 != source.shape[1]:
         raise ValueError("Expected exact x4 LR/HR relation")
@@ -351,6 +362,7 @@ def denoise_with_mask(pipe, lowres, source, mask, steps, seed, device, trace=Non
         raise ValueError("Mask must be a binary HxW image-size array")
     if not mask.any():
         return source.copy()
+    capture_steps = set(capture_steps or ())
     h, w = lowres.shape[:2]
     condition = to_tensor(lowres, device)
     mask_latent = F.interpolate(torch.as_tensor(mask, device=device, dtype=torch.float32)[None, None],
@@ -380,7 +392,8 @@ def denoise_with_mask(pipe, lowres, source, mask, steps, seed, device, trace=Non
             denoise_input = torch.cat([latents, condition], dim=1)
             denoise_input = scheduler.scale_model_input(denoise_input, timestep)
             predicted = pipe.unet(denoise_input, timestep).sample
-            latents = scheduler.step(predicted, timestep, latents, eta=0.0).prev_sample
+            ddim_output = scheduler.step(predicted, timestep, latents, eta=0.0)
+            latents = ddim_output.prev_sample
             # Critical lab modification: projection performed INSIDE EACH step.
             if reference_latent is not None:
                 if index + 1 < len(scheduler.timesteps):
@@ -394,6 +407,15 @@ def denoise_with_mask(pipe, lowres, source, mask, steps, seed, device, trace=Non
                     outside_error = (latents * (1 - mask_latent) -
                                      reference_t * (1 - mask_latent)).abs().max().item()
                     trace.append(float(outside_error))
+            # IMPORTANT: raw latents at early timesteps are NOISY and should not be
+            # decoded into a purported intermediate image. Use DDIM's estimate
+            # of the eventual clean sample (x0) for honest step diagnostics.
+            if step_images is not None and (index + 1) in capture_steps:
+                clean_estimate = getattr(ddim_output, "pred_original_sample", None)
+                if clean_estimate is None:
+                    raise RuntimeError("DDIM scheduler must expose pred_original_sample for step plots")
+                preview_rgb = to_rgb(pipe.vqvae.decode(clean_estimate).sample)
+                step_images[index + 1] = composite(source, preview_rgb, mask)
         generated = pipe.vqvae.decode(latents).sample
         generated = to_rgb(generated)
     if generated.shape != source.shape:
@@ -416,6 +438,137 @@ def plot_case(gt, source, baseline, post, masked, mask, title, filename):
     filename.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(filename, dpi=120, bbox_inches="tight")
     plt.close(fig)
+
+
+
+def preview_step_numbers(total_steps):
+    """Up to four actual step indices, including the first and final states."""
+    return sorted(set([1, max(1, round(total_steps / 3)),
+                       max(1, round(2 * total_steps / 3)), total_steps]))
+
+
+def step_image_path(folder, step):
+    return folder / f"estimated_clean_mixed_step_{step:03d}.png"
+
+
+def plot_three_masks(source, results, image_id, degradation, filename):
+    """Direct comparison of full, mixed and zero masks on the same input."""
+    from matplotlib.patches import Rectangle
+    kinds = ("full", "mixed", "zero")
+    descriptions = {"full": "FULL: all pixels can change",
+                    "mixed": "MIXED: central 25% can change",
+                    "zero": "ZERO: nothing can change"}
+    headers = ("Binary mask (white = change)", "Degraded input",
+               "post_only: mask after DDIM", "masked_sampling: mask each step")
+    fig, axes = plt.subplots(3, 4, figsize=(15, 11), squeeze=False)
+    for row, kind in enumerate(kinds):
+        mask = build_mask(kind, source.shape[0])
+        preview_images = (mask * 255, source, results[kind]["post"], results[kind]["masked"])
+        for col, (ax, picture) in enumerate(zip(axes[row], preview_images)):
+            ax.imshow(picture, cmap="gray" if picture.ndim == 2 else None,
+                      vmin=0 if picture.ndim == 2 else None,
+                      vmax=255 if picture.ndim == 2 else None)
+            ax.axis("off")
+            if col == 0:
+                ax.set_title(descriptions[kind], fontsize=10)
+                h0, w0 = mask.shape
+                ax.add_patch(Rectangle((-.5, -.5), w0, h0, fill=False,
+                                       edgecolor="dimgray", linewidth=1.5))
+            elif row == 0:
+                ax.set_title(headers[col], fontsize=10)
+            if kind == "mixed" and col in (2, 3):
+                h, w = mask.shape
+                ax.add_patch(Rectangle((w // 4 - .5, h // 4 - .5), w // 2, h // 2,
+                                       fill=False, edgecolor="yellow", linewidth=1.7))
+    fig.suptitle(f"DIV2K {image_id} | {degradation}: three mask variants", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, .96))
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(filename, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_ddim_progress(gt, source, mask, steps, step_images, image_id, degradation, filename):
+    """Show estimated clean images, NOT the noisy DDIM latent after each step."""
+    from matplotlib.patches import Rectangle
+    if not step_images:
+        raise ValueError("No DDIM intermediate steps to visualize")
+    ordered = sorted(step_images)
+    columns = max(4, len(ordered))
+    fig, axes = plt.subplots(2, columns, figsize=(3.3 * columns, 7.7), squeeze=False)
+    header = [("HR reference (evaluation only)", gt),
+              ("Degraded input (unchanged outside)", source),
+              ("Fixed MIXED mask (white = change)", mask * 255),
+              ("After final DDIM step", step_images[ordered[-1]])]
+    for col, (title, picture) in enumerate(header):
+        ax = axes[0, col]
+        ax.imshow(picture, cmap="gray" if picture.ndim == 2 else None,
+                  vmin=0 if picture.ndim == 2 else None,
+                  vmax=255 if picture.ndim == 2 else None)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+    for col in range(len(header), columns):
+        axes[0, col].axis("off")
+    h, w = mask.shape
+    for col, step in enumerate(ordered):
+        ax = axes[1, col]
+        ax.imshow(step_images[step])
+        ax.add_patch(Rectangle((w // 4 - .5, h // 4 - .5), w // 2, h // 2,
+                               fill=False, edgecolor="yellow", linewidth=1.7))
+        ax.set_title(f"Predicted clean image: step {step} / {steps}", fontsize=10)
+        ax.axis("off")
+    for col in range(len(ordered), columns):
+        axes[1, col].axis("off")
+    fig.suptitle(f"DIV2K {image_id} | {degradation} | MIXED mask: x0 estimates (NOT final SR at early steps)",
+                 fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, .94), h_pad=3.0, w_pad=1.2)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(filename, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def rebuild_plots_from_results(root, total_steps, want_progress=False):
+    """Rebuild mask-comparison figures without loading the diffusion model."""
+    dep_imports()
+    results_dir = root / "results"
+    plots_dir = root / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    for legacy_plot in plots_dir.glob("ddim_steps_*_mixed.png"):
+        legacy_plot.unlink(missing_ok=True)
+    if not want_progress:
+        for diagnostic in plots_dir.glob("ddim_clean_estimates_*_mixed.png"):
+            diagnostic.unlink(missing_ok=True)
+    count = 0
+    for source_path in sorted(results_dir.glob("*/*/degraded_input.png")):
+        folder = source_path.parent
+        image_id, degradation = folder.parent.name, folder.name
+        needed = [folder / f"{method}_{kind}.png"
+                  for kind in ("full", "mixed", "zero")
+                  for method in ("post_only", "masked")]
+        if not all(x.exists() for x in needed):
+            continue
+        source = np.asarray(Image.open(source_path).convert("RGB"), dtype=np.uint8)
+        results = {}
+        for kind in ("full", "mixed", "zero"):
+            results[kind] = {
+                "post": np.asarray(Image.open(folder / f"post_only_{kind}.png").convert("RGB"), dtype=np.uint8),
+                "masked": np.asarray(Image.open(folder / f"masked_{kind}.png").convert("RGB"), dtype=np.uint8),
+            }
+        plot_three_masks(source, results, image_id, degradation,
+                         plots_dir / f"compare_{image_id}_{degradation}_ALL_MASKS.png")
+        count += 1
+        if want_progress:
+            numbers = preview_step_numbers(total_steps)
+            paths = [step_image_path(folder, step) for step in numbers]
+            if all(p.exists() for p in paths) and (folder / "hr.png").exists():
+                frames = {n: np.asarray(Image.open(p).convert("RGB"), dtype=np.uint8)
+                          for n, p in zip(numbers, paths)}
+                gt = np.asarray(Image.open(folder / "hr.png").convert("RGB"), dtype=np.uint8)
+                plot_ddim_progress(gt, source, build_mask("mixed", source.shape[0]),
+                                   total_steps, frames, image_id, degradation,
+                                   plots_dir / f"ddim_clean_estimates_{image_id}_{degradation}_mixed.png")
+    print(f"[plots] Built {count} ALL_MASKS compare figures in {plots_dir}", flush=True)
+    if count == 0:
+        raise FileNotFoundError("No saved results found: " + str(results_dir))
 
 
 def write_csv(path, rows):
@@ -623,8 +776,24 @@ For ablation, `post_only` applies the mask after ordinary, unmodified DDIM.
 - `results/<image_id>/<degradation>/` contains HR, LR, degraded, mask, baseline,
   post-only and masked results.
 - `results/metrics.csv` per-case scores; `results/summary.csv` aggregate.
-- `plots/compare_*.png` visual comparisons; `plots/*_by_degradation.png`
-  and `plots/ablation_*.png` metric plots (when metrics available).
+- `plots/compare_*.png` original six-panel comparisons.
+- `plots/compare_*_ALL_MASKS.png` shows full, mixed and zero masks side-by-side,
+  with the post_only and masked_sampling results for each mask.
+- By default THREE-MASK comparisons, the original six-panel comparisons and
+  metric plots are created. Intermediate-step previews are OFF by default;
+  early noisy latents must not be shown as if they were clear photographs.
+- Optional `--step-plots` creates `plots/ddim_clean_estimates_*_mixed.png` for
+  the first image of each degradation. These show the predicted CLEAN (x0) image
+  at selected steps, not decoded still-noisy latents or changing masks.
+  Early estimates can still contain substantial distortions; the binary mask
+  remains FIXED at every step.
+- When `--step-plots` is enabled, predicted-clean estimates are saved as
+  `results/<image_id>/<degradation>/estimated_clean_mixed_step_*.png`;
+  no invented or interpolated intermediate frames are produced.
+- `plots/*_by_degradation.png` and `plots/ablation_*.png` metric plots.
+- `--plots-only` recreates ALL_MASKS figures from cached results without GPU.
+  To create optional DDIM clean estimates, run with `--step-plots`;
+  add `--step-plots-all-images` to evaluate every dataset image.
 
 ## Sources
 
@@ -669,7 +838,8 @@ def self_test():
         def scale_model_input(self, latents, timestep):
             return latents
         def step(self, prediction, timestep, latents, eta=0.0):
-            return SimpleNamespace(prev_sample=latents - prediction * 0.1)
+            return SimpleNamespace(prev_sample=latents - prediction * 0.1,
+                                   pred_original_sample=latents - prediction)
     class FakeUnet:
         def __call__(self, sample, timestep):
             return SimpleNamespace(sample=sample[:, :3] * .1)
@@ -687,6 +857,14 @@ def self_test():
     out = denoise_with_mask(fake, lr, source, m, 4, 42, torch.device("cpu"), trace)
     assert len(trace) == 4 and all(x < 1e-6 for x in trace), trace
     assert np.array_equal(out[m == 0], source[m == 0])
+    stage_frames = {}
+    stage_indices = set(preview_step_numbers(4))
+    out_with_frames = denoise_with_mask(fake, lr, source, m, 4, 42,
+                                       torch.device("cpu"), step_images=stage_frames,
+                                       capture_steps=stage_indices)
+    assert set(stage_frames) == stage_indices
+    assert np.array_equal(out_with_frames, out)
+    assert all(np.array_equal(frame[m == 0], source[m == 0]) for frame in stage_frames.values())
     assert np.array_equal(denoise_with_mask(fake, lr, source, build_mask("zero", 256),
                                            4, 42, torch.device("cpu")), source)
     print("PASS: 3 binary masks; x4 degradation; outside-pixel invariance; PSNR;",
@@ -704,6 +882,8 @@ def run(args):
     for folder in (data, output, plots):
         folder.mkdir(parents=True, exist_ok=True)
     emit_readme(args, root)
+    for legacy_plot in plots.glob("ddim_steps_*_mixed.png"):
+        legacy_plot.unlink(missing_ok=True)
     print("[system] {}, Python {}, PyTorch {}".format(platform.platform(),
                                                      platform.python_version(), torch.__version__), flush=True)
     device = choose_device(args.device)
@@ -743,8 +923,11 @@ def run(args):
             else:
                 previous = None
             if previous != signature:
-                for old in [folder / "ordinary_ldm_sr.png", *folder.glob("masked_*.png")]:
+                for old in [folder / "ordinary_ldm_sr.png", *folder.glob("masked_*.png"),
+                            *folder.glob("intermediate_mixed_step_*.png"),
+                            *folder.glob("estimated_clean_mixed_step_*.png")]:
                     old.unlink(missing_ok=True)
+                (plots / f"ddim_steps_{image_id}_{mode}_mixed.png").unlink(missing_ok=True)
                 manifest_file.write_text(json.dumps(signature, ensure_ascii=False, indent=2),
                                          encoding="utf-8")
             save_rgb(folder / "hr.png", gt)
@@ -768,14 +951,26 @@ def run(args):
                     masked = source.copy()
                 elif kind == "full":
                     masked = baseline.copy()
-                elif masked_path.exists():
-                    masked = np.asarray(Image.open(masked_path).convert("RGB"), dtype=np.uint8).copy()
-                    print("[resume] Masked SR:", folder, flush=True)
                 else:
-                    print("[sampling] image={}, degradation={}: modified DDIM / mixed mask".format(
-                        image_id, mode), flush=True)
-                    masked = denoise_with_mask(pipe, lowres, source, mask, args.steps,
-                                              args.seed, device)
+                    want_steps = (kind == "mixed" and args.step_plots and
+                                  not args.no_step_plots and
+                                  (image_pos == 0 or args.step_plots_all_images))
+                    target_steps = preview_step_numbers(args.steps) if want_steps else []
+                    missing_steps = any(not step_image_path(folder, step).exists()
+                                        for step in target_steps)
+                    if masked_path.exists() and not missing_steps:
+                        masked = np.asarray(Image.open(masked_path).convert("RGB"), dtype=np.uint8).copy()
+                        print("[resume] Masked SR:", folder, flush=True)
+                    else:
+                        print("[sampling] image={}, degradation={}: modified DDIM / mixed mask".format(
+                            image_id, mode), flush=True)
+                        step_frames = {} if want_steps else None
+                        masked = denoise_with_mask(pipe, lowres, source, mask, args.steps,
+                                                  args.seed, device, step_images=step_frames,
+                                                  capture_steps=set(target_steps))
+                        if step_frames is not None:
+                            for step, frame in step_frames.items():
+                                save_rgb(step_image_path(folder, step), frame)
                 save_rgb(folder / ("post_only_" + kind + ".png"), post)
                 save_rgb(masked_path, masked)
                 assert np.array_equal(masked[mask == 0], source[mask == 0])
@@ -791,6 +986,9 @@ def run(args):
                 torch.mps.empty_cache()
             elif device.type == "cuda":
                 torch.cuda.empty_cache()
+    # Compose every three-mask comparison directly from this run's saved outputs.
+    rebuild_plots_from_results(root, args.steps,
+                               want_progress=args.step_plots and not args.no_step_plots)
     # Free diffusion model before loading pretrained quality-evaluation models.
     del pipe
     import gc
@@ -829,6 +1027,9 @@ if __name__ == "__main__":
     if params.self_test:
         dep_imports()
         self_test()
+    elif params.plots_only:
+        rebuild_plots_from_results(params.out.expanduser().resolve(), params.steps,
+                                   want_progress=params.step_plots and not params.no_step_plots)
     else:
         bootstrap(params)
         run(params)
